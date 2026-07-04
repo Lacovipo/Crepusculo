@@ -861,6 +861,212 @@ int space_score(const Position& pos, int side, int nonPawnMaterial) {
     return score;
 }
 
+int chebyshev_distance(int a, int b) {
+    return std::max(std::abs(file_of(a) - file_of(b)), std::abs(rank_of(a) - rank_of(b)));
+}
+
+bool pawn_path_clear(const Position& pos, int sq, int side) {
+    int f = file_of(sq);
+    for (int r = rank_of(sq) + side; on_board(f, r); r += side) {
+        if (pos.board[make_sq(f, r)] != Empty) return false;
+    }
+    return true;
+}
+
+int pawn_promotion_moves(const Position& pos, int sq, int side) {
+    int r = rank_of(sq);
+    int moves = side == White ? 7 - r : r;
+    int homeRank = side == White ? 1 : 6;
+    int oneStep = r + side;
+    int twoStep = r + 2 * side;
+    if (r == homeRank && on_board(file_of(sq), twoStep) &&
+        pos.board[make_sq(file_of(sq), oneStep)] == Empty &&
+        pos.board[make_sq(file_of(sq), twoStep)] == Empty) {
+        --moves;
+    }
+    return moves;
+}
+
+bool pawn_is_passed(const Position& pos, int sq, int side) {
+    int f = file_of(sq);
+    int r = rank_of(sq);
+    for (int af = std::max(0, f - 1); af <= std::min(7, f + 1); ++af) {
+        for (int tr = r + side; on_board(af, tr); tr += side) {
+            if (pos.board[make_sq(af, tr)] == -side * Pawn) return false;
+        }
+    }
+    return true;
+}
+
+bool pawn_is_protected(const Position& pos, int sq, int side) {
+    int f = file_of(sq);
+    int r = rank_of(sq) - side;
+    for (int df : {-1, 1}) {
+        int nf = f + df;
+        if (on_board(nf, r) && pos.board[make_sq(nf, r)] == side * Pawn) return true;
+    }
+    return false;
+}
+
+int pawn_ending_passed_score(const Position& pos, int sq, int side, int ownKing, int enemyKing) {
+    int f = file_of(sq);
+    int r = rank_of(sq);
+    int relRank = side == White ? r : 7 - r;
+    int promotionSq = make_sq(f, side == White ? 7 : 0);
+    int oneAhead = make_sq(f, r + side);
+    int score = 55 + relRank * relRank * 12;
+
+    bool pathClear = pawn_path_clear(pos, sq, side);
+    bool protectedPasser = pawn_is_protected(pos, sq, side);
+    if (protectedPasser) score += 55 + relRank * 8;
+    if (!pathClear) score -= 45 + relRank * 7;
+
+    int enemyFrontDistance = chebyshev_distance(enemyKing, oneAhead);
+    int ownFrontDistance = chebyshev_distance(ownKing, oneAhead);
+    score += std::max(0, 42 - ownFrontDistance * 12);
+    score -= std::max(0, 36 - enemyFrontDistance * 12);
+
+    int moves = pawn_promotion_moves(pos, sq, side);
+    int enemyMoves = chebyshev_distance(enemyKing, promotionSq);
+    int enemyTempo = pos.side == -side ? 0 : 1;
+    if (pathClear && enemyMoves > moves + enemyTempo) {
+        score += 170 + relRank * 35;
+    } else if (pathClear && enemyMoves == moves + enemyTempo) {
+        score += protectedPasser ? 90 : 25;
+    } else if (pathClear) {
+        score -= 20;
+    }
+
+    int enemyBlockSq = make_sq(f, r + side);
+    if (enemyKing == enemyBlockSq && !protectedPasser) score -= 115 + relRank * 15;
+    if (ownKing == enemyBlockSq) score += 120 + relRank * 18;
+
+    int nearestEnemyPawn = 8;
+    for (int osq = 0; osq < 64; ++osq) {
+        if (pos.board[osq] == -side * Pawn) {
+            nearestEnemyPawn = std::min(nearestEnemyPawn, std::abs(file_of(osq) - f));
+        }
+    }
+    score += std::min(54, nearestEnemyPawn * 18);
+    return score;
+}
+
+int pawn_ending_side_score(const Position& pos, int side) {
+    int ownKing = pos.king_square(side);
+    int enemyKing = pos.king_square(-side);
+    if (ownKing < 0 || enemyKing < 0) return 0;
+
+    int score = 0;
+    std::array<int, 8> ownFiles{};
+    std::array<int, 8> enemyFiles{};
+    std::vector<int> pawns;
+    for (int sq = 0; sq < 64; ++sq) {
+        if (pos.board[sq] == side * Pawn) {
+            ++ownFiles[file_of(sq)];
+            pawns.push_back(sq);
+        } else if (pos.board[sq] == -side * Pawn) {
+            ++enemyFiles[file_of(sq)];
+        }
+    }
+
+    int spareTempi = 0;
+    for (int sq : pawns) {
+        int f = file_of(sq);
+        int r = rank_of(sq);
+        int relRank = side == White ? r : 7 - r;
+        int aheadRank = r + side;
+
+        score += relRank * 7;
+        score += std::max(0, 18 - chebyshev_distance(ownKing, sq) * 5);
+        score -= std::max(0, 16 - chebyshev_distance(enemyKing, sq) * 5);
+
+        if (pawn_is_passed(pos, sq, side)) {
+            score += pawn_ending_passed_score(pos, sq, side, ownKing, enemyKing);
+        } else {
+            bool candidate = true;
+            for (int af = std::max(0, f - 1); af <= std::min(7, f + 1); ++af) {
+                for (int tr = r + side; on_board(af, tr); tr += side) {
+                    if (pos.board[make_sq(af, tr)] == -side * Pawn && af == f) candidate = false;
+                }
+            }
+            if (candidate && relRank >= 3) score += 22 + relRank * 5;
+        }
+
+        if (on_board(f, aheadRank)) {
+            int blocker = pos.board[make_sq(f, aheadRank)];
+            if (blocker == side * Pawn) score -= 26;
+            if (blocker == -side * Pawn) score -= 34;
+            if (make_sq(f, aheadRank) == enemyKing) score -= 48;
+        }
+
+        bool opposed = false;
+        for (int tr = r + side; on_board(f, tr); tr += side) {
+            if (pos.board[make_sq(f, tr)] == -side * Pawn) opposed = true;
+        }
+        if (!opposed && ownFiles[f] > 0 && enemyFiles[f] == 0) score += 15;
+        if (r == (side == White ? 1 : 6)) ++spareTempi;
+    }
+
+    int leftMostOwn = 8;
+    int rightMostOwn = -1;
+    int leftMostEnemy = 8;
+    int rightMostEnemy = -1;
+    int ownCount = 0;
+    int enemyCount = 0;
+    for (int f = 0; f < 8; ++f) {
+        if (ownFiles[f] > 0) {
+            leftMostOwn = std::min(leftMostOwn, f);
+            rightMostOwn = std::max(rightMostOwn, f);
+            ownCount += ownFiles[f];
+        }
+        if (enemyFiles[f] > 0) {
+            leftMostEnemy = std::min(leftMostEnemy, f);
+            rightMostEnemy = std::max(rightMostEnemy, f);
+            enemyCount += enemyFiles[f];
+        }
+    }
+
+    score += (ownCount - enemyCount) * 24;
+    score += spareTempi * 9;
+    for (int f = 0; f < 8; ++f) {
+        if (ownFiles[f] > enemyFiles[f]) score += (ownFiles[f] - enemyFiles[f]) * 11;
+        if (ownFiles[f] > 1) score -= (ownFiles[f] - 1) * 14;
+    }
+
+    if (ownCount > 0 && enemyCount > 0) {
+        int outside = std::max(std::abs(leftMostOwn - leftMostEnemy), std::abs(rightMostOwn - rightMostEnemy));
+        score += outside * 10;
+    }
+
+    bool sameLineOpposition = file_of(ownKing) == file_of(enemyKing) || rank_of(ownKing) == rank_of(enemyKing);
+    int kGap = chebyshev_distance(ownKing, enemyKing);
+    if (sameLineOpposition && kGap >= 2) {
+        int emptySquaresBetween = kGap - 1;
+        if ((emptySquaresBetween & 1) == 1) {
+            int oppositionValue = kGap == 2 ? 34 : std::max(10, 28 - kGap * 3);
+            score += pos.side == -side ? oppositionValue : -oppositionValue;
+        }
+    }
+
+    if (sameLineOpposition && ownCount > 0 && enemyCount > 0) {
+        score += spareTempi * (pos.side == side ? 6 : 3);
+    }
+
+    return score;
+}
+
+int pawn_ending_score(const Position& pos) {
+    int whitePawns = 0;
+    int blackPawns = 0;
+    for (int piece : pos.board) {
+        if (piece == Pawn) ++whitePawns;
+        else if (piece == -Pawn) ++blackPawns;
+        else if (piece != Empty && std::abs(piece) != King) return 0;
+    }
+    if (whitePawns + blackPawns == 0) return 0;
+    return pawn_ending_side_score(pos, White) - pawn_ending_side_score(pos, Black);
+}
+
 int evaluate(Position& pos) {
     int score = 0;
     int nonPawnMaterial = 0;
@@ -980,6 +1186,7 @@ int evaluate(Position& pos) {
     } else {
         score += king_safety(pos, White) - king_safety(pos, Black);
     }
+    if (nonPawnMaterial == 0) score += pawn_ending_score(pos);
     score += pos.side * 8;
     return pos.side * score;
 }
@@ -1727,7 +1934,7 @@ private:
         std::string cmd;
         in >> cmd;
         if (cmd == "uci") {
-            std::cout << "id name Crepusculo 0.20\n";
+            std::cout << "id name Crepusculo 0.21\n";
             std::cout << "id author Codex\n";
             std::cout << "option name Hash type spin default 64 min 1 max 1024\n";
             std::cout << "option name Clear Hash type button\n";
