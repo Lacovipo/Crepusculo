@@ -107,6 +107,16 @@ struct Move {
     }
 };
 
+struct Position;
+
+std::uint64_t recompute_hash(const Position& pos);
+std::uint64_t hash_key(const Position& pos);
+std::uint64_t zobrist_piece_key(int piece, int sq);
+std::uint64_t zobrist_castling_key(int castling);
+std::uint64_t zobrist_ep_key(int file);
+std::uint64_t zobrist_side_key();
+bool has_en_passant_capturer(const Position& pos);
+
 std::string move_to_uci(const Move& move) {
     std::string out = square_to_string(move.from) + square_to_string(move.to);
     if (move.promotion != Empty) {
@@ -131,6 +141,7 @@ struct Undo {
     int ep = -1;
     int halfmove = 0;
     int fullmove = 1;
+    std::uint64_t key = 0;
 };
 
 struct Position {
@@ -140,6 +151,7 @@ struct Position {
     int ep = -1;
     int halfmove = 0;
     int fullmove = 1;
+    std::uint64_t key = 0;
 
     void clear() {
         board.fill(Empty);
@@ -148,6 +160,7 @@ struct Position {
         ep = -1;
         halfmove = 0;
         fullmove = 1;
+        key = 0;
     }
 
     bool set_fen(const std::string& fen) {
@@ -210,6 +223,7 @@ struct Position {
         if (whiteKings != 1 || blackKings != 1) return false;
 
         sanitize_castling_rights();
+        key = recompute_hash(*this);
         return true;
     }
 
@@ -309,17 +323,23 @@ struct Position {
     }
 
     Undo make_move(const Move& move) {
-        Undo undo{board[move.to], board[move.from], castling, ep, halfmove, fullmove};
+        Undo undo{board[move.to], board[move.from], castling, ep, halfmove, fullmove, key};
         int moved = board[move.from];
         int mover = moved > 0 ? White : Black;
         int captured = board[move.to];
+        if (has_en_passant_capturer(*this)) key ^= zobrist_ep_key(file_of(ep));
+        key ^= zobrist_castling_key(castling);
+        key ^= zobrist_piece_key(moved, move.from);
 
         board[move.from] = Empty;
         if (move.enPassant) {
             int capSq = move.to - mover * 8;
             captured = board[capSq];
             undo.captured = captured;
+            key ^= zobrist_piece_key(captured, capSq);
             board[capSq] = Empty;
+        } else if (captured != Empty) {
+            key ^= zobrist_piece_key(captured, move.to);
         }
 
         int placed = moved;
@@ -327,24 +347,34 @@ struct Position {
             placed = mover * move.promotion;
         }
         board[move.to] = placed;
+        key ^= zobrist_piece_key(placed, move.to);
 
         if (move.castle) {
             if (move.to == make_sq(6, 0)) {
+                key ^= zobrist_piece_key(Rook, make_sq(7, 0));
+                key ^= zobrist_piece_key(Rook, make_sq(5, 0));
                 board[make_sq(5, 0)] = board[make_sq(7, 0)];
                 board[make_sq(7, 0)] = Empty;
             } else if (move.to == make_sq(2, 0)) {
+                key ^= zobrist_piece_key(Rook, make_sq(0, 0));
+                key ^= zobrist_piece_key(Rook, make_sq(3, 0));
                 board[make_sq(3, 0)] = board[make_sq(0, 0)];
                 board[make_sq(0, 0)] = Empty;
             } else if (move.to == make_sq(6, 7)) {
+                key ^= zobrist_piece_key(-Rook, make_sq(7, 7));
+                key ^= zobrist_piece_key(-Rook, make_sq(5, 7));
                 board[make_sq(5, 7)] = board[make_sq(7, 7)];
                 board[make_sq(7, 7)] = Empty;
             } else if (move.to == make_sq(2, 7)) {
+                key ^= zobrist_piece_key(-Rook, make_sq(0, 7));
+                key ^= zobrist_piece_key(-Rook, make_sq(3, 7));
                 board[make_sq(3, 7)] = board[make_sq(0, 7)];
                 board[make_sq(0, 7)] = Empty;
             }
         }
 
         update_castling_rights(move.from, move.to, moved, captured);
+        key ^= zobrist_castling_key(castling);
         ep = -1;
         if (std::abs(moved) == Pawn && std::abs(move.to - move.from) == 16) {
             ep = (move.from + move.to) / 2;
@@ -354,16 +384,19 @@ struct Position {
         else ++halfmove;
         if (side == Black) ++fullmove;
         side = -side;
+        key ^= zobrist_side_key();
+        if (has_en_passant_capturer(*this)) key ^= zobrist_ep_key(file_of(ep));
         return undo;
     }
 
     void unmake_move(const Move& move, const Undo& undo) {
         side = -side;
+        int mover = side;
         board[move.from] = undo.moved;
         board[move.to] = undo.captured;
 
         if (move.enPassant) {
-            int capSq = move.to - side * 8;
+            int capSq = move.to - mover * 8;
             board[move.to] = Empty;
             board[capSq] = undo.captured;
         }
@@ -388,6 +421,7 @@ struct Position {
         ep = undo.ep;
         halfmove = undo.halfmove;
         fullmove = undo.fullmove;
+        key = undo.key;
     }
 };
 
@@ -426,6 +460,22 @@ const Zobrist& zobrist() {
     return keys;
 }
 
+std::uint64_t zobrist_piece_key(int piece, int sq) {
+    return zobrist().pieces[piece_index(piece)][sq];
+}
+
+std::uint64_t zobrist_castling_key(int castling) {
+    return zobrist().castling[castling & 15];
+}
+
+std::uint64_t zobrist_ep_key(int file) {
+    return zobrist().epFile[file];
+}
+
+std::uint64_t zobrist_side_key() {
+    return zobrist().side;
+}
+
 bool has_en_passant_capturer(const Position& pos) {
     if (pos.ep < 0) return false;
 
@@ -444,7 +494,7 @@ bool has_en_passant_capturer(const Position& pos) {
     return false;
 }
 
-std::uint64_t hash_key(const Position& pos) {
+std::uint64_t recompute_hash(const Position& pos) {
     const Zobrist& z = zobrist();
     std::uint64_t key = 0;
     for (int sq = 0; sq < 64; ++sq) {
@@ -457,13 +507,68 @@ std::uint64_t hash_key(const Position& pos) {
     return key;
 }
 
+std::uint64_t hash_key(const Position& pos) {
+    return pos.key;
+}
+
+bool insufficient_material(const Position& pos) {
+    int minors = 0;
+    int knights = 0;
+    std::array<int, 2> bishopsByColor{};
+
+    for (int sq = 0; sq < 64; ++sq) {
+        int piece = pos.board[sq];
+        if (piece == Empty || std::abs(piece) == King) continue;
+
+        int type = std::abs(piece);
+        if (type == Pawn || type == Rook || type == Queen) return false;
+        if (type == Knight) {
+            ++knights;
+            ++minors;
+        } else if (type == Bishop) {
+            ++bishopsByColor[(file_of(sq) + rank_of(sq)) & 1];
+            ++minors;
+        }
+    }
+
+    if (minors == 0) return true;
+    if (minors == 1) return true;
+
+    if (knights == 0) {
+        return bishopsByColor[0] == 0 || bishopsByColor[1] == 0;
+    }
+
+    return false;
+}
+
+struct MoveList {
+    std::array<Move, 256> moves;
+    size_t count;
+
+    MoveList() : count(0) {}
+
+    void push_back(const Move& move) {
+        if (count < moves.size()) moves[count++] = move;
+    }
+
+    bool empty() const { return count == 0; }
+    size_t size() const { return count; }
+    Move& front() { return moves[0]; }
+    const Move& front() const { return moves[0]; }
+    Move& operator[](size_t index) { return moves[index]; }
+    const Move& operator[](size_t index) const { return moves[index]; }
+    Move* begin() { return moves.data(); }
+    Move* end() { return moves.data() + count; }
+    const Move* begin() const { return moves.data(); }
+    const Move* end() const { return moves.data() + count; }
+};
+
 class MoveGen {
 public:
-    static std::vector<Move> legal_moves(Position& pos) {
-        std::vector<Move> pseudo;
+    static MoveList legal_moves(Position& pos) {
+        MoveList pseudo;
         generate_pseudo(pos, pseudo, false);
-        std::vector<Move> legal;
-        legal.reserve(pseudo.size());
+        MoveList legal;
         int mover = pos.side;
         for (const Move& move : pseudo) {
             Undo undo = pos.make_move(move);
@@ -473,10 +578,10 @@ public:
         return legal;
     }
 
-    static std::vector<Move> legal_captures(Position& pos) {
-        std::vector<Move> pseudo;
+    static MoveList legal_captures(Position& pos) {
+        MoveList pseudo;
         generate_pseudo(pos, pseudo, true);
-        std::vector<Move> legal;
+        MoveList legal;
         int mover = pos.side;
         for (const Move& move : pseudo) {
             Undo undo = pos.make_move(move);
@@ -487,17 +592,17 @@ public:
     }
 
 private:
-    static void add_promotion_moves(std::vector<Move>& moves, int from, int to, bool ep = false) {
+    static void add_promotion_moves(MoveList& moves, int from, int to, bool ep = false) {
         for (int promo : {Queen, Rook, Bishop, Knight}) {
             moves.push_back(Move{from, to, promo, ep, false});
         }
     }
 
-    static void add_move(std::vector<Move>& moves, int from, int to, int promotion = Empty, bool ep = false, bool castle = false) {
+    static void add_move(MoveList& moves, int from, int to, int promotion = Empty, bool ep = false, bool castle = false) {
         moves.push_back(Move{from, to, promotion, ep, castle});
     }
 
-    static void generate_pseudo(Position& pos, std::vector<Move>& moves, bool capturesOnly) {
+    static void generate_pseudo(Position& pos, MoveList& moves, bool capturesOnly) {
         int us = pos.side;
         for (int from = 0; from < 64; ++from) {
             int piece = pos.board[from];
@@ -697,6 +802,204 @@ int pseudo_mobility(const Position& pos, int side) {
     return mobility;
 }
 
+int phase_blend(int openingScore, int endgameScore, int nonPawnMaterial) {
+    int phase = std::clamp(nonPawnMaterial, 0, 6200);
+    return (openingScore * phase + endgameScore * (6200 - phase)) / 6200;
+}
+
+bool piece_attacks_target(const Position& pos, int from, int target) {
+    int piece = pos.board[from];
+    if (piece == Empty) return false;
+    int side = piece > 0 ? White : Black;
+    int type = std::abs(piece);
+    int ff = file_of(from);
+    int fr = rank_of(from);
+    int tf = file_of(target);
+    int tr = rank_of(target);
+    int df = tf - ff;
+    int dr = tr - fr;
+
+    if (type == Pawn) return dr == side && std::abs(df) == 1;
+    if (type == Knight) return std::abs(df) * std::abs(dr) == 2;
+    if (type == King) return std::max(std::abs(df), std::abs(dr)) == 1;
+
+    bool diagonal = std::abs(df) == std::abs(dr);
+    bool straight = df == 0 || dr == 0;
+    if (type == Bishop && !diagonal) return false;
+    if (type == Rook && !straight) return false;
+    if (type == Queen && !diagonal && !straight) return false;
+
+    int stepF = (df > 0) - (df < 0);
+    int stepR = (dr > 0) - (dr < 0);
+    int f = ff + stepF;
+    int r = fr + stepR;
+    while (on_board(f, r)) {
+        int sq = make_sq(f, r);
+        if (sq == target) return true;
+        if (pos.board[sq] != Empty) return false;
+        f += stepF;
+        r += stepR;
+    }
+    return false;
+}
+
+int piece_mobility_from(const Position& pos, int sq, int side) {
+    int piece = pos.board[sq];
+    int type = std::abs(piece);
+    int f = file_of(sq);
+    int r = rank_of(sq);
+    int mobility = 0;
+
+    if (type == Knight) {
+        constexpr int deltas[8][2] = {
+            {1, 2}, {2, 1}, {-1, 2}, {-2, 1}, {1, -2}, {2, -1}, {-1, -2}, {-2, -1}
+        };
+        for (auto& d : deltas) {
+            int nf = f + d[0];
+            int nr = r + d[1];
+            if (!on_board(nf, nr)) continue;
+            int target = pos.board[make_sq(nf, nr)];
+            if (target == Empty || (target > 0 ? White : Black) != side) ++mobility;
+        }
+    } else if (type == Bishop || type == Rook || type == Queen) {
+        static constexpr int dirs[8][2] = {
+            {1, 0}, {-1, 0}, {0, 1}, {0, -1}, {1, 1}, {1, -1}, {-1, 1}, {-1, -1}
+        };
+        int begin = type == Bishop ? 4 : 0;
+        int end = type == Rook ? 4 : 8;
+        for (int i = begin; i < end; ++i) {
+            int nf = f + dirs[i][0];
+            int nr = r + dirs[i][1];
+            while (on_board(nf, nr)) {
+                int target = pos.board[make_sq(nf, nr)];
+                if (target == Empty) {
+                    ++mobility;
+                } else {
+                    if ((target > 0 ? White : Black) != side) ++mobility;
+                    break;
+                }
+                nf += dirs[i][0];
+                nr += dirs[i][1];
+            }
+        }
+    }
+    return mobility;
+}
+
+int piece_activity_score(const Position& pos, int side, const std::array<std::array<int, 8>, 2>& pawnsByFile,
+                         int nonPawnMaterial) {
+    int opening = 0;
+    int endgame = 0;
+    int enemy = -side;
+    int enemyKing = pos.king_square(enemy);
+
+    for (int sq = 0; sq < 64; ++sq) {
+        int piece = pos.board[sq];
+        if (piece == Empty || (piece > 0 ? White : Black) != side) continue;
+        int type = std::abs(piece);
+        if (type == Pawn || type == King) continue;
+
+        int mob = piece_mobility_from(pos, sq, side);
+        if (type == Knight) {
+            opening += (mob - 4) * 4;
+            endgame += (mob - 4) * 4;
+        } else if (type == Bishop) {
+            opening += (mob - 6) * 5;
+            endgame += (mob - 6) * 5;
+        } else if (type == Rook) {
+            opening += (mob - 7) * 2;
+            endgame += (mob - 7) * 4;
+
+            int file = file_of(sq);
+            int color = side == White ? 0 : 1;
+            int enemyColor = color ^ 1;
+            if (pawnsByFile[color][file] == 0) {
+                opening += 8;
+                endgame += 10;
+                if (pawnsByFile[enemyColor][file] == 0) {
+                    opening += 10;
+                    endgame += 10;
+                }
+                if (enemyKing >= 0 && std::abs(file - file_of(enemyKing)) <= 1) opening += 8;
+            }
+        } else if (type == Queen) {
+            opening += (mob - 13);
+            endgame += (mob - 13) * 2;
+        }
+
+        int relRank = side == White ? rank_of(sq) : 7 - rank_of(sq);
+        if ((type == Rook || type == Queen) && relRank == 6 && enemyKing >= 0) {
+            int enemyBackRank = side == White ? 7 : 0;
+            if (rank_of(enemyKing) == enemyBackRank) {
+                opening += type == Rook ? 16 : 8;
+                endgame += type == Rook ? 28 : 14;
+            }
+        }
+    }
+
+    return phase_blend(opening, endgame, nonPawnMaterial);
+}
+
+int pawn_shelter_penalty(const Position& pos, int side, int kingSq) {
+    int penalty = 0;
+    int kf = file_of(kingSq);
+    int kr = rank_of(kingSq);
+    int dir = side == White ? 1 : -1;
+    for (int file = std::max(0, kf - 1); file <= std::min(7, kf + 1); ++file) {
+        int friendlyDist = 5;
+        for (int r = kr + dir; on_board(file, r); r += dir) {
+            if (pos.board[make_sq(file, r)] == side * Pawn) {
+                friendlyDist = std::abs(r - kr);
+                break;
+            }
+        }
+        if (friendlyDist == 1) penalty -= file == kf ? 6 : 3;
+        else if (friendlyDist == 2) penalty += file == kf ? 4 : 2;
+        else penalty += file == kf ? 16 : 10;
+
+        int stormDist = 5;
+        for (int r = kr + dir; on_board(file, r); r += dir) {
+            if (pos.board[make_sq(file, r)] == -side * Pawn) {
+                stormDist = std::abs(r - kr);
+                break;
+            }
+        }
+        if (stormDist <= 2) penalty += 14;
+        else if (stormDist == 3) penalty += 7;
+    }
+    return std::max(0, penalty);
+}
+
+int king_attack_pressure(const Position& pos, int side) {
+    int kingSq = pos.king_square(side);
+    if (kingSq < 0) return 0;
+    int attackers = 0;
+    int units = 0;
+    for (int sq = 0; sq < 64; ++sq) {
+        int piece = pos.board[sq];
+        if (piece == Empty || (piece > 0 ? White : Black) != -side) continue;
+        int type = std::abs(piece);
+        if (type == Pawn || type == King) continue;
+
+        bool attacksZone = piece_attacks_target(pos, sq, kingSq);
+        for (int df = -1; df <= 1 && !attacksZone; ++df) {
+            for (int dr = -1; dr <= 1 && !attacksZone; ++dr) {
+                int nf = file_of(kingSq) + df;
+                int nr = rank_of(kingSq) + dr;
+                if (on_board(nf, nr) && piece_attacks_target(pos, sq, make_sq(nf, nr))) attacksZone = true;
+            }
+        }
+        if (!attacksZone) continue;
+        ++attackers;
+        if (type == Knight || type == Bishop) units += 1;
+        else if (type == Rook) units += 2;
+        else if (type == Queen) units += 4;
+    }
+    if (attackers < 2) return units * 4;
+    int weight = std::min(16, attackers + units);
+    return units * (8 + weight * 3);
+}
+
 int king_safety(const Position& pos, int side) {
     int kingSq = pos.king_square(side);
     if (kingSq < 0) return 0;
@@ -721,6 +1024,8 @@ int king_safety(const Position& pos, int side) {
         }
     }
     if (!flankPawn) score -= 16;
+    score -= pawn_shelter_penalty(pos, side, kingSq);
+    score -= king_attack_pressure(pos, side);
 
     int enemy = -side;
     for (int df = -1; df <= 1; ++df) {
@@ -858,6 +1163,50 @@ int space_score(const Position& pos, int side, int nonPawnMaterial) {
             }
         }
     }
+    return score;
+}
+
+int fruit_pattern_score(const Position& pos, int side, int nonPawnMaterial) {
+    int score = 0;
+    int enemyPawn = -side * Pawn;
+    int ownBishop = side * Bishop;
+    int ownRook = side * Rook;
+    int ownKing = side * King;
+    int home = side == White ? 0 : 7;
+    int sixth = side == White ? 5 : 2;
+    int seventh = side == White ? 6 : 1;
+    int edgeTrap = phase_blend(70, 55, nonPawnMaterial);
+    int nearEdgeTrap = phase_blend(36, 28, nonPawnMaterial);
+
+    if (pos.board[make_sq(0, seventh)] == ownBishop && pos.board[make_sq(1, sixth)] == enemyPawn) score -= edgeTrap;
+    if (pos.board[make_sq(7, seventh)] == ownBishop && pos.board[make_sq(6, sixth)] == enemyPawn) score -= edgeTrap;
+    if (pos.board[make_sq(0, sixth)] == ownBishop && pos.board[make_sq(1, sixth - side)] == enemyPawn) score -= nearEdgeTrap;
+    if (pos.board[make_sq(7, sixth)] == ownBishop && pos.board[make_sq(6, sixth - side)] == enemyPawn) score -= nearEdgeTrap;
+
+    if (pos.board[make_sq(2, home)] == ownBishop &&
+        pos.board[make_sq(3, home + side)] == side * Pawn &&
+        pos.board[make_sq(3, home + 2 * side)] != Empty) {
+        score -= phase_blend(36, 8, nonPawnMaterial);
+    }
+    if (pos.board[make_sq(5, home)] == ownBishop &&
+        pos.board[make_sq(4, home + side)] == side * Pawn &&
+        pos.board[make_sq(4, home + 2 * side)] != Empty) {
+        score -= phase_blend(36, 8, nonPawnMaterial);
+    }
+
+    bool queenSideCastle = pos.board[make_sq(2, home)] == ownKing || pos.board[make_sq(1, home)] == ownKing;
+    bool kingSideCastle = pos.board[make_sq(6, home)] == ownKing || pos.board[make_sq(5, home)] == ownKing;
+    if (queenSideCastle &&
+        (pos.board[make_sq(0, home)] == ownRook || pos.board[make_sq(0, home + side)] == ownRook ||
+         pos.board[make_sq(1, home)] == ownRook)) {
+        score -= phase_blend(34, 4, nonPawnMaterial);
+    }
+    if (kingSideCastle &&
+        (pos.board[make_sq(7, home)] == ownRook || pos.board[make_sq(7, home + side)] == ownRook ||
+         pos.board[make_sq(6, home)] == ownRook)) {
+        score -= phase_blend(34, 4, nonPawnMaterial);
+    }
+
     return score;
 }
 
@@ -1176,11 +1525,13 @@ int evaluate(Position& pos) {
         }
     }
 
-    score += (pseudo_mobility(pos, White) - pseudo_mobility(pos, Black)) * 2;
+    score += piece_activity_score(pos, White, pawnsByFile, nonPawnMaterial) -
+             piece_activity_score(pos, Black, pawnsByFile, nonPawnMaterial);
     score += development_score(pos, White, nonPawnMaterial) - development_score(pos, Black, nonPawnMaterial);
     score += connected_rooks_score(pos, White) - connected_rooks_score(pos, Black);
     score += vulnerability_score(pos, White) - vulnerability_score(pos, Black);
     score += space_score(pos, White, nonPawnMaterial) - space_score(pos, Black, nonPawnMaterial);
+    score += fruit_pattern_score(pos, White, nonPawnMaterial) - fruit_pattern_score(pos, Black, nonPawnMaterial);
     if (nonPawnMaterial <= 2200) {
         score += king_activity(pos, White) - king_activity(pos, Black);
     } else {
@@ -1291,6 +1642,11 @@ private:
         std::uint8_t flag = 0;
     };
 
+    struct ScoredMove {
+        Move move;
+        int score = 0;
+    };
+
     Clock::time_point start;
     int limitMs = 0;
     std::uint64_t maxNodes = 0;
@@ -1341,10 +1697,15 @@ private:
     }
 
     int search_root(Position& pos, int depth, int alpha, int beta, Move& best) {
+        std::uint64_t key = hash_key(pos);
         std::uint16_t ttMove = probe_best_move(pos);
         auto moves = MoveGen::legal_moves(pos);
         order_moves(pos, moves, ttMove, 0);
         if (moves.empty()) return pos.in_check(pos.side) ? -MateScore : 0;
+        if (pos.halfmove >= 100 || insufficient_material(pos) || is_repetition(key)) {
+            best = moves.front();
+            return draw_score();
+        }
 
         int bestScore = -Inf;
         std::uint16_t bestPacked = 0;
@@ -1386,7 +1747,7 @@ private:
     int negamax(Position& pos, int depth, int alpha, int beta, int ply) {
         if (ply >= MaxPly - 1) return evaluate(pos);
         std::uint64_t key = hash_key(pos);
-        if (pos.halfmove >= 100 || is_repetition(key)) return draw_score();
+        if (pos.halfmove >= 100 || insufficient_material(pos) || is_repetition(key)) return draw_score();
         if ((nodes++ & 255ULL) == 0 && out_of_time()) {
             stopped = true;
             return alpha;
@@ -1428,14 +1789,17 @@ private:
             has_non_pawn_material(pos, pos.side)) {
             int oldEp = pos.ep;
             int oldHalfmove = pos.halfmove;
+            std::uint64_t oldKey = pos.key;
             pos.ep = -1;
             ++pos.halfmove;
             pos.side = -pos.side;
+            pos.key = recompute_hash(pos);
             int reduction = depth >= 6 ? 3 : 2;
             int score = -negamax(pos, depth - 1 - reduction, -beta, -beta + 1, ply + 1);
             pos.side = -pos.side;
             pos.halfmove = oldHalfmove;
             pos.ep = oldEp;
+            pos.key = oldKey;
             if (stopped) return alpha;
             if (score >= beta) return beta;
         }
@@ -1557,7 +1921,7 @@ private:
     int quiesce(Position& pos, int alpha, int beta, int ply) {
         if (ply >= MaxPly - 1) return evaluate(pos);
         std::uint64_t key = hash_key(pos);
-        if (pos.halfmove >= 100 || is_repetition(key)) return draw_score();
+        if (pos.halfmove >= 100 || insufficient_material(pos) || is_repetition(key)) return draw_score();
         if ((nodes++ & 255ULL) == 0 && out_of_time()) {
             stopped = true;
             return alpha;
@@ -1610,16 +1974,91 @@ private:
         return false;
     }
 
-    static bool gives_direct_check(const Position& pos, const Move& move) {
-        Position next = pos;
-        next.make_move(move);
-        return next.in_check(next.side);
+    static bool attacks_after_move(const Position& pos, int from, int target, int piece, int vacated, int epCapture) {
+        int side = piece > 0 ? White : Black;
+        int type = std::abs(piece);
+        int ff = file_of(from);
+        int fr = rank_of(from);
+        int tf = file_of(target);
+        int tr = rank_of(target);
+        int df = tf - ff;
+        int dr = tr - fr;
+
+        if (type == Pawn) return dr == side && std::abs(df) == 1;
+        if (type == Knight) return std::abs(df) * std::abs(dr) == 2;
+        if (type == King) return std::max(std::abs(df), std::abs(dr)) == 1;
+
+        bool diagonal = std::abs(df) == std::abs(dr);
+        bool straight = df == 0 || dr == 0;
+        if (type == Bishop && !diagonal) return false;
+        if (type == Rook && !straight) return false;
+        if (type == Queen && !diagonal && !straight) return false;
+
+        int stepF = (df > 0) - (df < 0);
+        int stepR = (dr > 0) - (dr < 0);
+        int f = ff + stepF;
+        int r = fr + stepR;
+        while (on_board(f, r)) {
+            int sq = make_sq(f, r);
+            if (sq == target) return true;
+            if (sq != vacated && sq != epCapture && pos.board[sq] != Empty) return false;
+            f += stepF;
+            r += stepR;
+        }
+        return false;
+    }
+
+    static bool discovered_check_after_move(const Position& pos, const Move& move, int enemyKing, int epCapture) {
+        int kf = file_of(enemyKing);
+        int kr = rank_of(enemyKing);
+        int ff = file_of(move.from);
+        int fr = rank_of(move.from);
+        int df = ff - kf;
+        int dr = fr - kr;
+        bool diagonal = std::abs(df) == std::abs(dr);
+        bool straight = df == 0 || dr == 0;
+        if (!diagonal && !straight) return false;
+
+        int stepF = (df > 0) - (df < 0);
+        int stepR = (dr > 0) - (dr < 0);
+        int f = kf + stepF;
+        int r = kr + stepR;
+        while (on_board(f, r)) {
+            int sq = make_sq(f, r);
+            if (sq == move.to) return false;
+            if (sq == move.from || sq == epCapture) {
+                f += stepF;
+                r += stepR;
+                continue;
+            }
+            int piece = pos.board[sq];
+            if (piece == Empty) {
+                f += stepF;
+                r += stepR;
+                continue;
+            }
+            if ((piece > 0 ? White : Black) != pos.side) return false;
+            int type = std::abs(piece);
+            if (diagonal) return type == Bishop || type == Queen;
+            return type == Rook || type == Queen;
+        }
+        return false;
+    }
+
+    static bool gives_direct_check_fast(const Position& pos, const Move& move) {
+        int enemyKing = pos.king_square(-pos.side);
+        if (enemyKing < 0) return false;
+        int moved = pos.board[move.from];
+        int placed = move.promotion != Empty ? pos.side * move.promotion : moved;
+        int epCapture = move.enPassant ? move.to - pos.side * 8 : -1;
+        if (attacks_after_move(pos, move.to, enemyKing, placed, move.from, epCapture)) return true;
+        return discovered_check_after_move(pos, move, enemyKing, epCapture);
     }
 
     static bool is_likely_bad_capture(const Position& pos, const Move& move) {
         int captured = pos.board[move.to];
         if (move.enPassant) captured = -pos.side * Pawn;
-        if (captured == Empty || move.promotion != Empty || gives_direct_check(pos, move)) return false;
+        if (captured == Empty || move.promotion != Empty || gives_direct_check_fast(pos, move)) return false;
 
         return see(pos, move) < -40;
     }
@@ -1738,12 +2177,15 @@ private:
     void store_tt(const Position& pos, int depth, int score, TTFlag flag, std::uint16_t bestMove, int ply) {
         std::uint64_t key = hash_key(pos);
         TTEntry& entry = tt[key & ttMask];
-        if (entry.key != key || depth >= entry.depth || flag == TTExact) {
+        bool replace = entry.key != key || depth >= entry.depth || flag == TTExact ||
+                       (bestMove != 0 && entry.bestMove == 0);
+        if (replace) {
+            bool sameKey = entry.key == key;
             entry.key = key;
             entry.depth = depth;
             entry.score = score_to_tt(score, ply);
             entry.flag = flag;
-            if (bestMove != 0) entry.bestMove = bestMove;
+            if (bestMove != 0 || !sameKey) entry.bestMove = bestMove;
         }
     }
 
@@ -1774,7 +2216,7 @@ private:
     bool is_repetition(std::uint64_t key) const {
         int seen = 0;
         for (auto it = repetitionHistory.rbegin(); it != repetitionHistory.rend(); ++it) {
-            if (*it == key && ++seen >= 2) return true;
+            if (*it == key && ++seen >= 3) return true;
         }
         return false;
     }
@@ -1797,10 +2239,10 @@ private:
             if (movedType > 0 && movedType <= King && victimType > 0 && victimType <= King) {
                 score += captureHistory[side_index(pos.side)][movedType][move.to][victimType] / 16;
             }
-            if (seeScore < -40 && move.promotion == Empty && !gives_direct_check(pos, move)) score -= 8'000;
+            if (seeScore < -40 && move.promotion == Empty && !gives_direct_check_fast(pos, move)) score -= 8'000;
         }
         if (move.promotion != Empty) score += piece_value(move.promotion);
-        if (gives_direct_check(pos, move)) score += 6'000;
+        if (gives_direct_check_fast(pos, move)) score += 6'000;
         if (move.castle) score += 30;
         if (is_quiet(pos, move)) {
             std::uint16_t packed = pack_move(move);
@@ -1811,10 +2253,19 @@ private:
         return score;
     }
 
-    void order_moves(const Position& pos, std::vector<Move>& moves, std::uint16_t ttMove, int ply) const {
-        std::sort(moves.begin(), moves.end(), [&](const Move& a, const Move& b) {
-            return move_score(pos, a, ttMove, ply) > move_score(pos, b, ttMove, ply);
+    void order_moves(const Position& pos, MoveList& moves, std::uint16_t ttMove, int ply) const {
+        std::array<ScoredMove, 256> scored{};
+        size_t count = std::min(scored.size(), moves.size());
+        for (size_t i = 0; i < count; ++i) {
+            scored[i] = ScoredMove{moves[i], move_score(pos, moves[i], ttMove, ply)};
+        }
+
+        std::sort(scored.begin(), scored.begin() + static_cast<std::ptrdiff_t>(count), [](const ScoredMove& a, const ScoredMove& b) {
+            return a.score > b.score;
         });
+        for (size_t i = 0; i < count; ++i) {
+            moves[i] = scored[i].move;
+        }
     }
 
     std::string principal_variation(const Position& root, const Move& first, int maxDepth) const {
@@ -1934,7 +2385,7 @@ private:
         std::string cmd;
         in >> cmd;
         if (cmd == "uci") {
-            std::cout << "id name Crepusculo 0.21\n";
+            std::cout << "id name Crepusculo 0.23\n";
             std::cout << "id author Codex\n";
             std::cout << "option name Hash type spin default 64 min 1 max 1024\n";
             std::cout << "option name Clear Hash type button\n";
