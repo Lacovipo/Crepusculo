@@ -142,10 +142,12 @@ struct Undo {
     int halfmove = 0;
     int fullmove = 1;
     std::uint64_t key = 0;
+    std::array<int, 2> kingSq{};
 };
 
 struct Position {
     std::array<int, 64> board{};
+    std::array<int, 2> kingSq{make_sq(4, 0), make_sq(4, 7)};
     int side = White;
     int castling = CastleWK | CastleWQ | CastleBK | CastleBQ;
     int ep = -1;
@@ -155,6 +157,7 @@ struct Position {
 
     void clear() {
         board.fill(Empty);
+        kingSq = {-1, -1};
         side = White;
         castling = 0;
         ep = -1;
@@ -216,9 +219,15 @@ struct Position {
 
         int whiteKings = 0;
         int blackKings = 0;
-        for (int piece : board) {
-            whiteKings += piece == King;
-            blackKings += piece == -King;
+        for (int sq = 0; sq < 64; ++sq) {
+            int piece = board[sq];
+            if (piece == King) {
+                ++whiteKings;
+                kingSq[0] = sq;
+            } else if (piece == -King) {
+                ++blackKings;
+                kingSq[1] = sq;
+            }
         }
         if (whiteKings != 1 || blackKings != 1) return false;
 
@@ -230,11 +239,7 @@ struct Position {
     void set_startpos() { set_fen(StartFen); }
 
     int king_square(int color) const {
-        int king = color * King;
-        for (int sq = 0; sq < 64; ++sq) {
-            if (board[sq] == king) return sq;
-        }
-        return -1;
+        return kingSq[color == White ? 0 : 1];
     }
 
     bool square_attacked(int sq, int bySide) const {
@@ -323,7 +328,7 @@ struct Position {
     }
 
     Undo make_move(const Move& move) {
-        Undo undo{board[move.to], board[move.from], castling, ep, halfmove, fullmove, key};
+        Undo undo{board[move.to], board[move.from], castling, ep, halfmove, fullmove, key, kingSq};
         int moved = board[move.from];
         int mover = moved > 0 ? White : Black;
         int captured = board[move.to];
@@ -347,6 +352,7 @@ struct Position {
             placed = mover * move.promotion;
         }
         board[move.to] = placed;
+        if (std::abs(moved) == King) kingSq[mover == White ? 0 : 1] = move.to;
         key ^= zobrist_piece_key(placed, move.to);
 
         if (move.castle) {
@@ -422,6 +428,7 @@ struct Position {
         halfmove = undo.halfmove;
         fullmove = undo.fullmove;
         key = undo.key;
+        kingSq = undo.kingSq;
     }
 };
 
@@ -1416,10 +1423,173 @@ int pawn_ending_score(const Position& pos) {
     return pawn_ending_side_score(pos, White) - pawn_ending_side_score(pos, Black);
 }
 
+bool pawn_has_phalanx(const Position& pos, int sq, int side) {
+    int f = file_of(sq);
+    int r = rank_of(sq);
+    for (int df : {-1, 1}) {
+        int nf = f + df;
+        if (on_board(nf, r) && pos.board[make_sq(nf, r)] == side * Pawn) return true;
+    }
+    return false;
+}
+
+int advanced_pawn_structure_score(const Position& pos, int side,
+                                  const std::array<std::array<int, 8>, 2>& pawnsByFile) {
+    int score = 0;
+    int color = side == White ? 0 : 1;
+    for (int sq = 0; sq < 64; ++sq) {
+        if (pos.board[sq] != side * Pawn) continue;
+        int f = file_of(sq);
+        int r = rank_of(sq);
+        int relRank = side == White ? r : 7 - r;
+        bool isolated = (f == 0 || pawnsByFile[color][f - 1] == 0) &&
+                        (f == 7 || pawnsByFile[color][f + 1] == 0);
+        bool protectedPawn = pawn_is_protected(pos, sq, side);
+        bool phalanx = pawn_has_phalanx(pos, sq, side);
+
+        if (protectedPawn || phalanx) {
+            score += 4 + relRank * 2;
+            if (phalanx) score += 3 + relRank;
+        }
+
+        int stopRank = r + side;
+        if (!isolated && !protectedPawn && !phalanx && !pawn_is_passed(pos, sq, side) &&
+            on_board(f, stopRank) && pos.board[make_sq(f, stopRank)] == Empty) {
+            int stopSq = make_sq(f, stopRank);
+            if (pawn_attacks_square(pos, stopSq, -side) && !pawn_attacks_square(pos, stopSq, side)) {
+                score -= 10 + relRank;
+                if (pawnsByFile[color ^ 1][f] == 0) score -= 5;
+            }
+        }
+    }
+    return score;
+}
+
+int bishop_quality_score(const Position& pos, int side, int bishopCount, int nonPawnMaterial) {
+    if (bishopCount == 0) return 0;
+    int score = 0;
+
+    bool queensidePawn = false;
+    bool kingsidePawn = false;
+    for (int sq = 0; sq < 64; ++sq) {
+        if (pos.board[sq] != side * Pawn) continue;
+        if (file_of(sq) <= 2) queensidePawn = true;
+        if (file_of(sq) >= 5) kingsidePawn = true;
+    }
+    if (queensidePawn && kingsidePawn) score += phase_blend(3, 12, nonPawnMaterial);
+
+    if (bishopCount == 1) {
+        int bishopSq = -1;
+        for (int sq = 0; sq < 64; ++sq) {
+            if (pos.board[sq] == side * Bishop) {
+                bishopSq = sq;
+                break;
+            }
+        }
+        if (bishopSq >= 0) {
+            int bishopColor = (file_of(bishopSq) + rank_of(bishopSq)) & 1;
+            int sameColorPawns = 0;
+            for (int sq = 0; sq < 64; ++sq) {
+                if (pos.board[sq] == side * Pawn && ((file_of(sq) + rank_of(sq)) & 1) == bishopColor) {
+                    ++sameColorPawns;
+                }
+            }
+            score -= phase_blend(sameColorPawns * 2, sameColorPawns * 4, nonPawnMaterial);
+        }
+    }
+    return score;
+}
+
+int passer_file_support_score(const Position& pos, int sq, int side, int relRank) {
+    int f = file_of(sq);
+    int score = 0;
+    for (int r = rank_of(sq) - side; on_board(f, r); r -= side) {
+        int piece = pos.board[make_sq(f, r)];
+        if (piece == Empty) continue;
+        int type = std::abs(piece);
+        if ((piece > 0 ? White : Black) == side) {
+            if (type == Rook) score += 16 + relRank * 3;
+            else if (type == Queen) score += 10 + relRank * 2;
+        } else {
+            if (type == Rook) score -= 24 + relRank * 4;
+            else if (type == Queen) score -= 14 + relRank * 3;
+        }
+        break;
+    }
+    return score;
+}
+
+bool enemy_major_controls_square(const Position& pos, int targetSq, int side) {
+    for (int sq = 0; sq < 64; ++sq) {
+        int piece = pos.board[sq];
+        if (piece != -side * Rook && piece != -side * Queen) continue;
+        bool sameLine = file_of(sq) == file_of(targetSq) || rank_of(sq) == rank_of(targetSq);
+        if (sameLine && clear_line_between(pos, sq, targetSq)) return true;
+    }
+    return false;
+}
+
+int passed_pawn_major_brake_score(const Position& pos, int sq, int side, int relRank, int nonPawnMaterial) {
+    if (nonPawnMaterial == 0 || nonPawnMaterial > 2400) return 0;
+
+    int f = file_of(sq);
+    int forwardRank = rank_of(sq) + side;
+    if (!on_board(f, forwardRank)) return 0;
+
+    int stopSq = make_sq(f, forwardRank);
+    int ownKingSq = pos.king_square(side);
+    bool protectedByOwnKing = ownKingSq >= 0 && chebyshev_distance(ownKingSq, stopSq) <= 1;
+    bool controlledByMajor = enemy_major_controls_square(pos, stopSq, side);
+
+    int score = 0;
+    if (controlledByMajor && !protectedByOwnKing) score -= 42 + relRank * 11;
+
+    int enemyKingSq = pos.king_square(-side);
+    if (enemyKingSq >= 0) {
+        int promotionSq = make_sq(f, side == White ? 7 : 0);
+        int kingStopDistance = chebyshev_distance(enemyKingSq, stopSq);
+        int kingPromotionDistance = chebyshev_distance(enemyKingSq, promotionSq);
+        if (kingStopDistance <= 2 && !protectedByOwnKing) score -= 28 + relRank * 7;
+        if (kingPromotionDistance <= 2 && controlledByMajor) score -= 22 + relRank * 6;
+    }
+
+    return score;
+}
+
+int opposite_bishop_scale(const Position& pos, int score,
+                          const std::array<std::array<int, 7>, 2>& pieceCounts) {
+    if (score == 0) return score;
+    if (pieceCounts[0][Bishop] != 1 || pieceCounts[1][Bishop] != 1) return score;
+    for (int type : {Knight, Rook, Queen}) {
+        if (pieceCounts[0][type] != 0 || pieceCounts[1][type] != 0) return score;
+    }
+
+    int whiteBishop = -1;
+    int blackBishop = -1;
+    int whitePawns = 0;
+    int blackPawns = 0;
+    for (int sq = 0; sq < 64; ++sq) {
+        if (pos.board[sq] == Bishop) whiteBishop = sq;
+        else if (pos.board[sq] == -Bishop) blackBishop = sq;
+        else if (pos.board[sq] == Pawn) ++whitePawns;
+        else if (pos.board[sq] == -Pawn) ++blackPawns;
+    }
+    if (whiteBishop < 0 || blackBishop < 0) return score;
+    if (((file_of(whiteBishop) + rank_of(whiteBishop) + file_of(blackBishop) + rank_of(blackBishop)) & 1) == 0) {
+        return score;
+    }
+
+    int pawnDiff = std::abs(whitePawns - blackPawns);
+    if (whitePawns < 4 && blackPawns < 4) return score * 55 / 100;
+    if (pawnDiff <= 1) return score * 70 / 100;
+    return score * 85 / 100;
+}
+
 int evaluate(Position& pos) {
     int score = 0;
     int nonPawnMaterial = 0;
     std::array<int, 2> bishops{};
+    std::array<std::array<int, 7>, 2> pieceCounts{};
     std::array<std::array<int, 8>, 2> pawnsByFile{};
     for (int sq = 0; sq < 64; ++sq) {
         int p = pos.board[sq];
@@ -1435,6 +1605,7 @@ int evaluate(Position& pos) {
         score += sign * (piece_value(p) + pst);
         if (std::abs(p) == Bishop) ++bishops[color];
         if (std::abs(p) == Pawn) ++pawnsByFile[color][f];
+        ++pieceCounts[color][std::abs(p)];
         if (std::abs(p) != Pawn && std::abs(p) != King) nonPawnMaterial += piece_value(p);
     }
 
@@ -1487,6 +1658,8 @@ int evaluate(Position& pos) {
                     }
                 }
                 if (protectedByPawn) bonus += 10 + relRank * 3;
+                bonus += passer_file_support_score(pos, sq, sign, relRank);
+                bonus += passed_pawn_major_brake_score(pos, sq, sign, relRank, nonPawnMaterial);
 
                 int enemyKingSq = pos.king_square(-sign);
                 if (enemyKingSq >= 0) {
@@ -1522,9 +1695,25 @@ int evaluate(Position& pos) {
                 if (on_board(nf, attackerRank) && pos.board[make_sq(nf, attackerRank)] == -sign * Pawn) attackedByEnemyPawn = true;
             }
             if (relRank >= 3 && defendedByPawn && !attackedByEnemyPawn) score += sign * 20;
+        } else if (std::abs(p) == Bishop) {
+            int relRank = sign == White ? r : 7 - r;
+            bool defendedByPawn = false;
+            bool attackedByEnemyPawn = false;
+            int defenderRank = r - sign;
+            int attackerRank = r + sign;
+            for (int df : {-1, 1}) {
+                int nf = f + df;
+                if (on_board(nf, defenderRank) && pos.board[make_sq(nf, defenderRank)] == sign * Pawn) defendedByPawn = true;
+                if (on_board(nf, attackerRank) && pos.board[make_sq(nf, attackerRank)] == -sign * Pawn) attackedByEnemyPawn = true;
+            }
+            if (relRank >= 3 && defendedByPawn && !attackedByEnemyPawn) score += sign * 12;
         }
     }
 
+    score += advanced_pawn_structure_score(pos, White, pawnsByFile) -
+             advanced_pawn_structure_score(pos, Black, pawnsByFile);
+    score += bishop_quality_score(pos, White, bishops[0], nonPawnMaterial) -
+             bishop_quality_score(pos, Black, bishops[1], nonPawnMaterial);
     score += piece_activity_score(pos, White, pawnsByFile, nonPawnMaterial) -
              piece_activity_score(pos, Black, pawnsByFile, nonPawnMaterial);
     score += development_score(pos, White, nonPawnMaterial) - development_score(pos, Black, nonPawnMaterial);
@@ -1538,6 +1727,7 @@ int evaluate(Position& pos) {
         score += king_safety(pos, White) - king_safety(pos, Black);
     }
     if (nonPawnMaterial == 0) score += pawn_ending_score(pos);
+    score = opposite_bishop_scale(pos, score, pieceCounts);
     score += pos.side * 8;
     return pos.side * score;
 }
@@ -1572,6 +1762,7 @@ public:
         stopped = false;
         nodes = 0;
         killers = {};
+        if (++ttGeneration == 0) ttGeneration = 1;
         age_heuristics();
         repetitionHistory = gameHistory;
         if (repetitionHistory.empty() || repetitionHistory.back() != hash_key(root)) {
@@ -1640,6 +1831,7 @@ private:
         int score = 0;
         std::uint16_t bestMove = 0;
         std::uint8_t flag = 0;
+        std::uint8_t generation = 0;
     };
 
     struct ScoredMove {
@@ -1656,6 +1848,7 @@ private:
     std::uint64_t nodes = 0;
     std::vector<TTEntry> tt;
     std::size_t ttMask = 0;
+    std::uint8_t ttGeneration = 1;
     std::array<std::array<std::uint16_t, 2>, MaxPly> killers{};
     std::array<std::array<std::array<int, 64>, 64>, 2> history{};
     std::array<std::array<std::array<std::array<int, 7>, 64>, 7>, 2> captureHistory{};
@@ -1790,10 +1983,11 @@ private:
             int oldEp = pos.ep;
             int oldHalfmove = pos.halfmove;
             std::uint64_t oldKey = pos.key;
+            if (has_en_passant_capturer(pos)) pos.key ^= zobrist_ep_key(file_of(pos.ep));
             pos.ep = -1;
             ++pos.halfmove;
             pos.side = -pos.side;
-            pos.key = recompute_hash(pos);
+            pos.key ^= zobrist_side_key();
             int reduction = depth >= 6 ? 3 : 2;
             int score = -negamax(pos, depth - 1 - reduction, -beta, -beta + 1, ply + 1);
             pos.side = -pos.side;
@@ -2178,13 +2372,14 @@ private:
         std::uint64_t key = hash_key(pos);
         TTEntry& entry = tt[key & ttMask];
         bool replace = entry.key != key || depth >= entry.depth || flag == TTExact ||
-                       (bestMove != 0 && entry.bestMove == 0);
+                       (bestMove != 0 && entry.bestMove == 0) || entry.generation != ttGeneration;
         if (replace) {
             bool sameKey = entry.key == key;
             entry.key = key;
             entry.depth = depth;
             entry.score = score_to_tt(score, ply);
             entry.flag = flag;
+            entry.generation = ttGeneration;
             if (bestMove != 0 || !sameKey) entry.bestMove = bestMove;
         }
     }
@@ -2385,7 +2580,7 @@ private:
         std::string cmd;
         in >> cmd;
         if (cmd == "uci") {
-            std::cout << "id name Crepusculo 0.23\n";
+            std::cout << "id name Crepusculo 0.25\n";
             std::cout << "id author Codex\n";
             std::cout << "option name Hash type spin default 64 min 1 max 1024\n";
             std::cout << "option name Clear Hash type button\n";
@@ -2421,6 +2616,11 @@ private:
         } else if (cmd == "bench") {
             stop_search();
             bench();
+        } else if (cmd == "eval") {
+            int stmScore = evaluate(pos);
+            int whiteScore = pos.side * stmScore;
+            std::cout << "static eval cp " << stmScore << " stm"
+                      << " white_cp " << whiteScore << '\n' << std::flush;
         } else if (cmd == "d") {
             print_board();
         }
