@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <charconv>
 #include <chrono>
 #include <cctype>
 #include <cstdint>
@@ -94,6 +95,23 @@ std::optional<int> parse_square(const std::string& s) {
     return make_sq(s[0] - 'a', s[1] - '1');
 }
 
+std::optional<int> parse_int_strict(std::string value) {
+    while (!value.empty() && std::isspace(static_cast<unsigned char>(value.front()))) {
+        value.erase(value.begin());
+    }
+    while (!value.empty() && std::isspace(static_cast<unsigned char>(value.back()))) {
+        value.pop_back();
+    }
+    if (value.empty()) return std::nullopt;
+
+    int parsed = 0;
+    const char* first = value.data();
+    const char* last = value.data() + value.size();
+    auto result = std::from_chars(first, last, parsed);
+    if (result.ec != std::errc() || result.ptr != last) return std::nullopt;
+    return parsed;
+}
+
 struct Move {
     int from = 0;
     int to = 0;
@@ -178,18 +196,20 @@ struct Position {
         int file = 0;
         for (char c : placement) {
             if (c == '/') {
-                if (file != 8) return false;
+                if (file != 8 || rank <= 0) return false;
                 --rank;
                 file = 0;
                 continue;
             }
             if (std::isdigit(static_cast<unsigned char>(c))) {
+                if (c == '0') return false;
                 file += c - '0';
                 if (file > 8) return false;
                 continue;
             }
             int piece = char_to_piece(c);
             if (piece == Empty || rank < 0 || file >= 8) return false;
+            if (std::abs(piece) == Pawn && (rank == 0 || rank == 7)) return false;
             board[make_sq(file, rank)] = piece;
             ++file;
         }
@@ -217,6 +237,10 @@ struct Position {
             ep = *sq;
         }
 
+        if (halfmove < 0 || fullmove <= 0) return false;
+        std::string extra;
+        if (in >> extra) return false;
+
         int whiteKings = 0;
         int blackKings = 0;
         for (int sq = 0; sq < 64; ++sq) {
@@ -230,6 +254,14 @@ struct Position {
             }
         }
         if (whiteKings != 1 || blackKings != 1) return false;
+
+        if (ep != -1) {
+            int epRank = rank_of(ep);
+            if ((side == White && epRank != 5) || (side == Black && epRank != 2)) return false;
+            if (board[ep] != Empty) return false;
+            int pawnSq = ep - side * 8;
+            if (pawnSq < 0 || pawnSq >= 64 || board[pawnSq] != -side * Pawn) return false;
+        }
 
         sanitize_castling_rights();
         key = recompute_hash(*this);
@@ -2580,7 +2612,7 @@ private:
         std::string cmd;
         in >> cmd;
         if (cmd == "uci") {
-            std::cout << "id name Crepusculo 0.25\n";
+            std::cout << "id name Crepusculo 0.26\n";
             std::cout << "id author Codex\n";
             std::cout << "option name Hash type spin default 64 min 1 max 1024\n";
             std::cout << "option name Clear Hash type button\n";
@@ -2637,30 +2669,43 @@ private:
         std::string name;
         std::string value;
         while (in >> token) {
-            if (token == "name") {
-                name.clear();
-                while (in >> token && token != "value") {
-                    if (!name.empty()) name.push_back(' ');
-                    name += token;
+            if (token != "name") continue;
+            name.clear();
+            while (in >> token) {
+                if (token == "value") {
+                    std::getline(in, value);
+                    while (!value.empty() && std::isspace(static_cast<unsigned char>(value.front()))) {
+                        value.erase(value.begin());
+                    }
+                    break;
                 }
-                if (token != "value") break;
-                std::getline(in, value);
-                while (!value.empty() && std::isspace(static_cast<unsigned char>(value.front()))) {
-                    value.erase(value.begin());
-                }
-                break;
+                if (!name.empty()) name.push_back(' ');
+                name += token;
             }
+            break;
         }
 
-        if (name == "Hash" && !value.empty()) {
-            hashMb = std::clamp(std::stoi(value), 1, 1024);
-            searcher->resize_hash(hashMb);
+        if (name == "Hash") {
+            if (auto parsed = parse_int_strict(value)) {
+                hashMb = std::clamp(*parsed, 1, 1024);
+                searcher->resize_hash(hashMb);
+            } else if (!value.empty()) {
+                std::cout << "info string invalid Hash value\n" << std::flush;
+            }
         } else if (name == "Clear Hash") {
             searcher->clear_hash();
-        } else if (name == "Move Overhead" && !value.empty()) {
-            moveOverheadMs = std::clamp(std::stoi(value), 0, 5000);
-        } else if (name == "Contempt" && !value.empty()) {
-            contemptCp = std::clamp(std::stoi(value), -100, 100);
+        } else if (name == "Move Overhead") {
+            if (auto parsed = parse_int_strict(value)) {
+                moveOverheadMs = std::clamp(*parsed, 0, 5000);
+            } else if (!value.empty()) {
+                std::cout << "info string invalid Move Overhead value\n" << std::flush;
+            }
+        } else if (name == "Contempt") {
+            if (auto parsed = parse_int_strict(value)) {
+                contemptCp = std::clamp(*parsed, -100, 100);
+            } else if (!value.empty()) {
+                std::cout << "info string invalid Contempt value\n" << std::flush;
+            }
         }
     }
 
@@ -2679,7 +2724,12 @@ private:
                 if (i) fen.push_back(' ');
                 fen += parts[i];
             }
-            if (!pos.set_fen(fen)) pos.set_startpos();
+            Position candidate = pos;
+            if (!candidate.set_fen(fen)) {
+                std::cout << "info string invalid fen\n" << std::flush;
+                return;
+            }
+            pos = candidate;
             positionHistory = {hash_key(pos)};
         }
 
